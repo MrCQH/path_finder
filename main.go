@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"math"
 	"math/rand"
 	"time"
 
@@ -59,7 +60,7 @@ func main() {
 		clearCorridor(grid, t.start, t.goal, 5)
 	}
 
-	fmt.Println("=== SLG 寻路系统 (1500x1500, 聚集障碍~2%) ===\n")
+	fmt.Println("=== SLG 寻路系统 (1500x1500, 聚集障碍~2%) ===")
 
 	// ---- A* (4/6/8方向) ----
 	astar := pathfind.NewAStar(grid)
@@ -128,30 +129,33 @@ func main() {
 	fmt.Printf("  Flow Field(4dir)构建: %v\n", time.Since(t1))
 
 	// ---- Throughput test ----
-	fmt.Println("\n=== 吞吐量 (中距300格, 单goroutine, 1s) ===")
-	mids := pathfind.Point{40, 40}
-	midg := pathfind.Point{340, 260}
-	clearCorridor(grid, mids, midg, 5)
+	fmt.Println("\n=== 吞吐量 (60%近距[30-80]格 + 30%中距[200-400]格 + 10%远距[500-800]格, 1s) ===")
 
-	throughputTest("A*4  ", func() []pathfind.Point { return astar.FindPath(mids, midg) }, 1*time.Second)
-	throughputTest("A*6  ", func() []pathfind.Point { return astar.FindPath6(mids, midg) }, 1*time.Second)
-	throughputTest("A*8  ", func() []pathfind.Point { return astar.FindPath8(mids, midg) }, 1*time.Second)
-	throughputTest("双向4 ", func() []pathfind.Point { return biastar.FindPath(mids, midg) }, 1*time.Second)
-	throughputTest("双向6 ", func() []pathfind.Point { return biastar.FindPath6(mids, midg) }, 1*time.Second)
-	throughputTest("JPS  ", func() []pathfind.Point { return jps.FindPath(mids, midg) }, 1*time.Second)
-	throughputTest("HPA4 ", func() []pathfind.Point { return hpa.FindPath(mids, midg) }, 1*time.Second)
-	throughputTest("HPA6 ", func() []pathfind.Point { return hpa.FindPath6(mids, midg) }, 1*time.Second)
+	nearPairs := genPairs(rng, W, H, nearDist[0], nearDist[1], 600)
+	midPairs := genPairs(rng, W, H, midDist[0], midDist[1], 300)
+	farPairs := genPairs(rng, W, H, farDist[0], farDist[1], 100)
+
+	throughputDist("A*4  ", grid, func(s, g pathfind.Point) []pathfind.Point { return astar.FindPath(s, g) }, nearPairs, midPairs, farPairs, 1*time.Second)
+	throughputDist("A*6  ", grid, func(s, g pathfind.Point) []pathfind.Point { return astar.FindPath6(s, g) }, nearPairs, midPairs, farPairs, 1*time.Second)
+	throughputDist("A*8  ", grid, func(s, g pathfind.Point) []pathfind.Point { return astar.FindPath8(s, g) }, nearPairs, midPairs, farPairs, 1*time.Second)
+	throughputDist("双向4 ", grid, func(s, g pathfind.Point) []pathfind.Point { return biastar.FindPath(s, g) }, nearPairs, midPairs, farPairs, 1*time.Second)
+	throughputDist("双向6 ", grid, func(s, g pathfind.Point) []pathfind.Point { return biastar.FindPath6(s, g) }, nearPairs, midPairs, farPairs, 1*time.Second)
+	throughputDist("JPS  ", grid, func(s, g pathfind.Point) []pathfind.Point { return jps.FindPath(s, g) }, nearPairs, midPairs, farPairs, 1*time.Second)
+	throughputDist("HPA4 ", grid, func(s, g pathfind.Point) []pathfind.Point { return hpa.FindPath(s, g) }, nearPairs, midPairs, farPairs, 1*time.Second)
+	throughputDist("HPA6 ", grid, func(s, g pathfind.Point) []pathfind.Point { return hpa.FindPath6(s, g) }, nearPairs, midPairs, farPairs, 1*time.Second)
 
 	// ---- Path Cache ----
 	fmt.Println("\n--- 路径缓存 ---")
 	cache := pathfind.NewPathCache(10000)
-	sx := mids.X / 50
-	sy := mids.Y / 50
-	gx := midg.X / 50
-	gy := midg.Y / 50
+	cacheStart := pathfind.Point{40, 40}
+	cacheGoal := pathfind.Point{340, 260}
+	sx := cacheStart.X / 50
+	sy := cacheStart.Y / 50
+	gx := cacheGoal.X / 50
+	gy := cacheGoal.Y / 50
 
 	t0 := time.Now()
-	path := hpa.FindPath(mids, midg)
+	path := hpa.FindPath(cacheStart, cacheGoal)
 	fmt.Printf("  首次寻路: %v (路径长度=%d)\n", time.Since(t0), len(path))
 	cache.Set(sx, sy, gx, gy, path)
 
@@ -193,13 +197,89 @@ func runTest(algo, name string, fn func() []pathfind.Point) {
 	fmt.Printf("  [%s] %s: %d步, %v\n", algo, name, len(path)-1, elapsed)
 }
 
-func throughputTest(name string, fn func() []pathfind.Point, duration time.Duration) {
-	count := 0
-	deadline := time.Now().Add(duration)
-	for time.Now().Before(deadline) {
-		fn()
-		count++
+var (
+	nearDist = [2]int32{30, 80}
+	midDist  = [2]int32{200, 400}
+	farDist  = [2]int32{500, 800}
+)
+
+func clampInt(v, lo, hi int32) int32 {
+	if v < lo {
+		return lo
 	}
-	perSec := float64(count) / duration.Seconds()
-	fmt.Printf("  %s %d次 / %.0f req/s\n", name, count, perSec)
+	if v > hi {
+		return hi
+	}
+	return v
+}
+
+func randomPair(rng *rand.Rand, W, H, minDist, maxDist int32) (pathfind.Point, pathfind.Point) {
+	start := pathfind.Point{X: rng.Int31n(W), Y: rng.Int31n(H)}
+	angle := rng.Float64() * 2 * math.Pi
+	dist := minDist + rng.Int31n(maxDist-minDist+1)
+	dx := int32(float64(dist) * math.Cos(angle))
+	dy := int32(float64(dist) * math.Sin(angle))
+	gx := clampInt(start.X+dx, 0, W-1)
+	gy := clampInt(start.Y+dy, 0, H-1)
+	return start, pathfind.Point{X: gx, Y: gy}
+}
+
+type benchPair struct {
+	Start, Goal pathfind.Point
+}
+
+func genPairs(rng *rand.Rand, W, H, minDist, maxDist, count int32) []benchPair {
+	pairs := make([]benchPair, count)
+	for i := range pairs {
+		pairs[i].Start, pairs[i].Goal = randomPair(rng, W, H, minDist, maxDist)
+	}
+	return pairs
+}
+
+func throughputDist(name string, grid *pathfind.Grid,
+	findFn func(start, goal pathfind.Point) []pathfind.Point,
+	nearPairs, midPairs, farPairs []benchPair,
+	duration time.Duration) {
+
+	nearIdx, midIdx, farIdx := 0, 0, 0
+	nearCnt, midCnt, farCnt := 0, 0, 0
+	deadline := time.Now().Add(duration)
+	iter := 0
+
+	for time.Now().Before(deadline) {
+		iter++
+		switch iter % 10 {
+		case 0, 1, 2, 3, 4, 5: // 60% 近距
+			for {
+				p := nearPairs[nearIdx%len(nearPairs)]
+				nearIdx++
+				if path := findFn(p.Start, p.Goal); path != nil {
+					nearCnt++
+					break
+				}
+			}
+		case 6, 7, 8: // 30% 中距
+			for {
+				p := midPairs[midIdx%len(midPairs)]
+				midIdx++
+				if path := findFn(p.Start, p.Goal); path != nil {
+					midCnt++
+					break
+				}
+			}
+		default: // iter%10 == 9: 10% 远距
+			for {
+				p := farPairs[farIdx%len(farPairs)]
+				farIdx++
+				if path := findFn(p.Start, p.Goal); path != nil {
+					farCnt++
+					break
+				}
+			}
+		}
+	}
+
+	total := nearCnt + midCnt + farCnt
+	perSec := float64(total) / duration.Seconds()
+	fmt.Printf("  %s %d次 (近%d/中%d/远%d) / %.0f req/s\n", name, total, nearCnt, midCnt, farCnt, perSec)
 }
